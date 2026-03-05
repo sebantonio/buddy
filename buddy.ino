@@ -728,7 +728,8 @@ void setup() {
   setCpuFrequencyMhz(80);
 
   // Watchdog: reinicia si se cuelga más de 30s
-  esp_task_wdt_init(30, true);
+  const esp_task_wdt_config_t wdtCfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdtCfg);
   esp_task_wdt_add(NULL);
 
   Serial.begin(115200);
