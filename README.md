@@ -82,8 +82,32 @@ Parámetros configurables: SSID, contraseña WiFi, API key OpenWeatherMap, ciuda
 
 ## Versiones
 
-| Versión | Cambios |
-|---|---|
-| v1.2.0 | Timeout OLED (1 min), todas las optimizaciones de batería |
-| v1.1.0 | CPU a 80MHz, WiFi apagado entre actualizaciones, clima cada 4h, deep sleep mejorado |
-| v1.0.0 | Versión inicial |
+### v1.3.0 — `buddy3.ino`
+Mejoras avanzadas de rendimiento y robustez:
+- **Light sleep** en lugar de `delay()` cuando la pantalla está apagada (~15mA de ahorro adicional)
+- **Clima en RTC memory**: al despertar de noche no conecta WiFi, usa los últimos datos guardados
+- **Fade out suave** del brillo OLED antes de apagar (tanto en timeout como en deep sleep)
+- **Brillo restaurado** a 127 al encender la pantalla o arrancar
+- **Resync NTP cada 24h** para evitar deriva del reloj (~1-2s/hora sin resync)
+- **Retry con backoff x3** en `getWeather()` si falla WiFi o la API (0s, 2s, 4s)
+- **Watchdog de 30s**: reinicio automático si el código se cuelga en algún `while`
+- **DHT solo con pantalla encendida**: no tiene sentido leer el sensor si no se muestra
+- **Hora de última actualización** del clima visible en la página de tiempo online
+- **Animación "Actualizando..."** en pantalla mientras conecta WiFi cada 4h
+
+### v1.2.0 — `buddy2.ino`
+Timeout de pantalla OLED:
+- La pantalla OLED se apaga automáticamente tras **1 minuto** sin actividad
+- El primer toque solo enciende la pantalla, sin cambiar de página
+- El loop salta el dibujado mientras la pantalla está apagada
+
+### v1.1.0 — `buddy.ino`
+Optimizaciones de batería:
+- CPU reducida de 240MHz a **80MHz** (~40mA de ahorro)
+- **WiFi apagado** tras cada petición al clima y reconectado solo cuando es necesario
+- Intervalo de actualización del clima ampliado de 10 min a **4 horas**
+- Display y WiFi apagados antes del **deep sleep**
+- Loop limitado a **~30fps** con `delay(33)`
+
+### v1.0.0
+Versión inicial.
