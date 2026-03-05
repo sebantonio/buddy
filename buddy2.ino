@@ -11,9 +11,15 @@
 #include <DHT.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <esp_task_wdt.h>
 
 // ================= DEEP SLEEP =================
 RTC_DATA_ATTR bool hadNTPSync = false;
+// Último clima conocido en RTC (sobrevive al deep sleep)
+RTC_DATA_ATTR float    rtcApiTemp    = 0;
+RTC_DATA_ATTR float    rtcFeelsLike  = 0;
+RTC_DATA_ATTR char     rtcWeatherMain[16] = "";
+RTC_DATA_ATTR char     rtcWeatherDesc[32] = "";
 #define SLEEP_HOUR_START      21
 #define SLEEP_HOUR_END         6
 #define NIGHT_WAKE_MS      30000UL
@@ -140,9 +146,14 @@ String weatherMain = "";
 String weatherDesc = "";
 unsigned long lastWeatherUpdate = 0;
 unsigned long lastDHTRead = 0;
+char weatherUpdateTime[6] = "--:--";   // "HH:MM" de la última actualización
 
-// [OPT-3] Clima cada 4 horas en lugar de 10 minutos
+// Clima cada 4 horas
 #define WEATHER_UPDATE_MS 14400000UL
+
+// NTP resync cada 24 horas
+#define NTP_RESYNC_MS 86400000UL
+unsigned long lastNTPSync = 0;
 
 // Páginas: 0=Ojos, 1=Reloj, 2=Clima local (DHT), 3=Clima online (API)
 int currentPage = 0;
@@ -277,6 +288,7 @@ void initTime() {
   struct tm t;
   int intentos = 0;
   while (!getLocalTime(&t) && intentos < 10) { delay(500); intentos++; }
+  lastNTPSync = millis();
 }
 
 // =================================================
@@ -310,6 +322,19 @@ bool isNightTime() {
 
 void drawUltraProEye(Eye& e, bool isLeft);  // forward declaration
 
+// Animación WiFi mientras conecta
+void drawWiFiConnecting() {
+  static int dots = 0;
+  display.clearDisplay();
+  display.setFont(NULL);
+  display.setCursor(20, 20);
+  display.print("Actualizando");
+  display.setCursor(52, 34);
+  for (int i = 0; i < (dots % 4); i++) display.print(".");
+  display.display();
+  dots++;
+}
+
 void goToDeepSleep() {
   currentMood = MOOD_SLEEPY;
   leftEye.targetW = rightEye.targetW = 38;
@@ -333,20 +358,47 @@ void goToDeepSleep() {
     delay(30);
   }
 
-  // [OPT-4] Apagar display y WiFi antes del deep sleep
+  // Fade out brillo antes de apagar
+  for (int b = 127; b >= 0; b -= 16) {
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command(b);
+    delay(20);
+  }
   display.clearDisplay();
   display.display();
   display.ssd1306_command(SSD1306_DISPLAYOFF);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
+  esp_task_wdt_deinit();
   esp_deep_sleep_enable_gpio_wakeup(1ULL << TOUCH_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
   esp_deep_sleep_start();
 }
 
 void getWeather() {
-  // [OPT-2] Conectar WiFi solo para esta llamada
-  if (!connectWiFi()) return;
+  // Mostrar animación mientras conecta
+  drawWiFiConnecting();
+
+  // Retry con backoff: hasta 3 intentos (2s, 4s)
+  bool connected = false;
+  for (int attempt = 0; attempt < 3 && !connected; attempt++) {
+    if (attempt > 0) {
+      Serial.printf("Reintento WiFi #%d\n", attempt);
+      delay(2000 * attempt);
+    }
+    connected = connectWiFi();
+  }
+  if (!connected) {
+    Serial.println(">>> getWeather: sin WiFi, usando datos RTC <<<");
+    // Usar último clima conocido de RTC
+    if (strlen(rtcWeatherMain) > 0) {
+      apiTemperature = rtcApiTemp;
+      feelsLike      = rtcFeelsLike;
+      weatherMain    = String(rtcWeatherMain);
+      weatherDesc    = String(rtcWeatherDesc);
+    }
+    return;
+  }
 
   HTTPClient http;
   String url = "http://api.openweathermap.org/data/2.5/weather?lat=" +
@@ -362,15 +414,34 @@ void getWeather() {
       feelsLike      = double(obj["main"]["feels_like"]);
       weatherMain    = (const char*)obj["weather"][0]["main"];
       weatherDesc    = (const char*)obj["weather"][0]["description"];
+
+      // Guardar en RTC para sobrevivir deep sleep
+      rtcApiTemp   = apiTemperature;
+      rtcFeelsLike = feelsLike;
+      weatherMain.toCharArray(rtcWeatherMain, sizeof(rtcWeatherMain));
+      weatherDesc.toCharArray(rtcWeatherDesc, sizeof(rtcWeatherDesc));
+
+      // Guardar hora de actualización
+      struct tm t;
+      if (getLocalTime(&t))
+        sprintf(weatherUpdateTime, "%02d:%02d", t.tm_hour, t.tm_min);
+
       checkNightMode();
+    }
+  } else {
+    Serial.printf(">>> HTTP error %d, usando datos RTC <<<\n", httpCode);
+    if (strlen(rtcWeatherMain) > 0) {
+      apiTemperature = rtcApiTemp;
+      feelsLike      = rtcFeelsLike;
+      weatherMain    = String(rtcWeatherMain);
+      weatherDesc    = String(rtcWeatherDesc);
     }
   }
   http.end();
 
-  // [OPT-2] Apagar WiFi inmediatamente tras la petición
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  Serial.println(">>> WiFi OFF (hasta próxima actualización de clima) <<<");
+  Serial.println(">>> WiFi OFF <<<");
 }
 
 // =================================================
@@ -564,15 +635,20 @@ void drawOnlineWeather() {
   display.setCursor(0, 45);
   display.print(weatherDesc);
   display.setCursor(0, 56);
-  display.print("ST: ");
+  display.print("ST:");
   display.print((int)feelsLike);
-  display.print("C");
+  display.print("C ");
+  display.print(weatherUpdateTime); // hora última actualización
 }
 
 // =================================================
 // BOOT ANIMATION
 // =================================================
 void bootAnimation() {
+  // Restaurar brillo normal al arrancar
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(127);
+
   leftEye.h  = rightEye.h  = 2;
   leftEye.velH = rightEye.velH = 0;
   leftEye.targetH = rightEye.targetH = 2;
@@ -648,8 +724,12 @@ void drawPomodoro() {
 // SETUP
 // =================================================
 void setup() {
-  // [OPT-1] Reducir CPU de 240MHz a 80MHz
+  // Reducir CPU de 240MHz a 80MHz
   setCpuFrequencyMhz(80);
+
+  // Watchdog: reinicia si se cuelga más de 30s
+  esp_task_wdt_init(30, true);
+  esp_task_wdt_add(NULL);
 
   Serial.begin(115200);
   Serial.println("\n===== INICIO =====");
@@ -668,6 +748,13 @@ void setup() {
   bool touchWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
   if (touchWake && hadNTPSync && isNightTime()) {
     Serial.println(">>> Wake nocturno por touch <<<");
+    // Usar datos RTC sin conectar WiFi
+    if (strlen(rtcWeatherMain) > 0) {
+      apiTemperature = rtcApiTemp;
+      feelsLike      = rtcFeelsLike;
+      weatherMain    = String(rtcWeatherMain);
+      weatherDesc    = String(rtcWeatherDesc);
+    }
     nightWakeActive = true;
     nightWakeStart  = millis();
     bootAnimation();
@@ -681,7 +768,7 @@ void setup() {
   hadNTPSync = true;
   getWeather(); // WiFi se apaga dentro de getWeather()
   lastWeatherUpdate = millis();
-  lastActivityTime = millis();
+  lastActivityTime  = millis();
   bootAnimation();
   if (isNightTime() && !touchWake) {
     goToDeepSleep();
@@ -692,6 +779,8 @@ void setup() {
 // LOOP
 // =================================================
 void loop() {
+  esp_task_wdt_reset(); // alimentar watchdog
+
   if (inConfigMode) {
     server.handleClient();
     return;
@@ -706,6 +795,9 @@ void loop() {
     // Si la pantalla estaba apagada, solo encenderla y consumir el toque
     if (!screenOn) {
       display.ssd1306_command(SSD1306_DISPLAYON);
+      // Restaurar brillo normal
+      display.ssd1306_command(SSD1306_SETCONTRAST);
+      display.ssd1306_command(127);
       screenOn = true;
       lastActivityTime = now;
       lastAutoRotate   = now;
@@ -713,6 +805,7 @@ void loop() {
     }
   }
   if (touch) lastActivityTime = now;
+
   if (touch && !touchHandled && now - touchStartTime > LONG_PRESS_MS) {
     touchHandled = true;
     if (currentPage == 4) {
@@ -754,7 +847,8 @@ void loop() {
     lastSaccade    = 0;
   }
 
-  if (now - lastDHTRead > 2000) {
+  // Solo leer DHT si la pantalla está encendida
+  if (screenOn && now - lastDHTRead > 2000) {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
     if (!isnan(t) && !isnan(h)) { temperature = t; humidity = h; }
@@ -762,10 +856,20 @@ void loop() {
     lastDHTRead = now;
   }
 
-  // [OPT-3] Actualizar clima cada 4 horas
+  // Actualizar clima cada 4 horas
   if (now - lastWeatherUpdate > WEATHER_UPDATE_MS) {
-    getWeather(); // WiFi se enciende y apaga dentro de getWeather()
+    getWeather();
     lastWeatherUpdate = now;
+  }
+
+  // Resync NTP cada 24 horas
+  if (now - lastNTPSync > NTP_RESYNC_MS) {
+    if (connectWiFi()) {
+      initTime();
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      Serial.println(">>> NTP resync OK <<<");
+    }
   }
 
   if (nightWakeActive && now - nightWakeStart > NIGHT_WAKE_MS) {
@@ -777,17 +881,26 @@ void loop() {
     if (pomoState == POMO_IDLE && isNightTime()) goToDeepSleep();
   }
 
-  // Timeout pantalla: apagar si no hay actividad en 1 minuto
+  // Timeout pantalla: fade y apagar si no hay actividad en 1 minuto
   if (screenOn && now - lastActivityTime > SCREEN_TIMEOUT_MS) {
+    // Fade out suave antes de apagar
+    for (int b = 127; b >= 0; b -= 16) {
+      display.ssd1306_command(SSD1306_SETCONTRAST);
+      display.ssd1306_command(b);
+      delay(15);
+    }
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     screenOn = false;
   }
 
   updatePomodoro();
   if (!screenOn) {
-    delay(33);
+    // Light sleep 33ms en lugar de delay (ahorra ~15mA adicionales)
+    esp_sleep_enable_timer_wakeup(33 * 1000);
+    esp_light_sleep_start();
     return;
   }
+
   display.clearDisplay();
   switch (currentPage) {
     case 0: drawEmoPage();       break;
@@ -798,6 +911,6 @@ void loop() {
   }
   display.display();
 
-  // [OPT-3] ~30fps es suficiente, libera CPU entre frames
+  // ~30fps, libera CPU entre frames
   delay(33);
 }
