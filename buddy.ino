@@ -163,6 +163,11 @@ unsigned long lastAutoRotate = 0;
 // Chequeo modo noche
 unsigned long lastMoodCheck = 0;
 
+// Timeout pantalla OLED
+#define SCREEN_TIMEOUT_MS 60000UL
+unsigned long lastActivityTime = 0;
+bool screenOn = true;
+
 // Pomodoro
 #define POMO_IDLE  0
 #define POMO_WORK  1
@@ -676,6 +681,7 @@ void setup() {
   hadNTPSync = true;
   getWeather(); // WiFi se apaga dentro de getWeather()
   lastWeatherUpdate = millis();
+  lastActivityTime = millis();
   bootAnimation();
   if (isNightTime() && !touchWake) {
     goToDeepSleep();
@@ -697,7 +703,16 @@ void loop() {
   if (touch && !lastTouch) {
     touchStartTime = now;
     touchHandled   = false;
+    // Si la pantalla estaba apagada, solo encenderla y consumir el toque
+    if (!screenOn) {
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      screenOn = true;
+      lastActivityTime = now;
+      lastAutoRotate   = now;
+      touchHandled = true;
+    }
   }
+  if (touch) lastActivityTime = now;
   if (touch && !touchHandled && now - touchStartTime > LONG_PRESS_MS) {
     touchHandled = true;
     if (currentPage == 4) {
@@ -762,7 +777,17 @@ void loop() {
     if (pomoState == POMO_IDLE && isNightTime()) goToDeepSleep();
   }
 
+  // Timeout pantalla: apagar si no hay actividad en 1 minuto
+  if (screenOn && now - lastActivityTime > SCREEN_TIMEOUT_MS) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    screenOn = false;
+  }
+
   updatePomodoro();
+  if (!screenOn) {
+    delay(33);
+    return;
+  }
   display.clearDisplay();
   switch (currentPage) {
     case 0: drawEmoPage();       break;
